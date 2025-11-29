@@ -62,13 +62,13 @@ You can also train class-conditional CFM models on popular image classification 
 To train a class-conditional CFM on MNIST dataset, run:
 
 ```bash
-python train_flow_matching_on_images.py --do_train --dataset mnist
+python train_flow_matching_on_image.py --do_train --dataset mnist
 ```
 
 After training, you can now generate samples with:
 
 ```bash
-python train_flow_matching_on_images.py --do_sample --dataset mnist
+python train_flow_matching_on_image.py --do_sample --dataset mnist
 ```
 
 Now, you should be able to see the generated samples in the `outputs/cfm/mnist/` directory.
