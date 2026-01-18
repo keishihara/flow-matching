@@ -7,7 +7,7 @@ authors = [
 ]
 license = { text = "CC BY-NC-SA 4.0" }
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -16,14 +16,16 @@ classifiers = [
 dependencies = [
     "einops==0.8.0",
     "gdown>=5.2.0",
+    "jaxtyping>=0.2.36",
     "matplotlib>=3.9.2",
     "scikit-learn>=1.6.0",
     "scipy==1.14.1",
-    "torch==2.4.1",
+    "torch>=2.4.1",
     "torchdiffeq>=0.2.5",
     "torchvision",
     "tqdm==4.66.5",
     "transformers>=4.48.0",
+    "tyro>=0.9.35",
 ]
 
 [build-system]
@@ -57,6 +59,7 @@ ignore = [
     "B905",  # Zip-without-explicit-strict
     "E501",  # Line too long
     "F403",  # Unable to detect undefined names
+    "F722",  # Forward annotation syntax error
     "N812",  # Lowercase imported as non-lowercase
     "N999",  # Invalid module name
     "PLR0912",  # Too many branches
