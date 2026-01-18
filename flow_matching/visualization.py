@@ -76,9 +76,9 @@ def plot_ode_sampling_evolution(
     fig, axes = plt.subplots(1, sample_steps, figsize=(2 * sample_steps, 2))
 
     for i in range(sample_steps):
-        H = axes[i].hist2d(sol[i, :, 0], sol[i, :, 1], bins=300, range=square_range)
+        h = axes[i].hist2d(sol[i, :, 0], sol[i, :, 1], bins=300, range=square_range)
         cmin = 0.0
-        cmax = torch.quantile(torch.from_numpy(H[0]), 0.99).item()
+        cmax = torch.quantile(torch.from_numpy(h[0]), 0.99).item()
         norm = cm.colors.Normalize(vmax=cmax, vmin=cmin)
         axes[i].hist2d(sol[i, :, 0], sol[i, :, 1], bins=300, norm=norm, range=square_range)
         axes[i].set_aspect("equal")
@@ -220,15 +220,13 @@ def plot_likelihood(
     # sample with likelihood
     step_size = 0.05
 
-    square_range = dataset.get_square_range()
-    extent = sum(square_range, [])  # flatten
+    x_range, y_range = dataset.get_square_range()
+    extent = [*x_range, *y_range]
     grid_size = 200
-    x_1 = torch.meshgrid(
-        torch.linspace(extent[1], extent[0], grid_size),
-        torch.linspace(extent[2], extent[3], grid_size),
-        indexing="ij",
-    )
-    x_1 = torch.stack([x_1[0].flatten(), x_1[1].flatten()], dim=1).to(device)
+    x = torch.linspace(x_range[0], x_range[1], grid_size, device=device)
+    y = torch.linspace(y_range[0], y_range[1], grid_size, device=device)
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    x_1 = torch.stack([xx.flatten(), yy.flatten()], dim=1)
 
     # source distribution is an isotropic gaussian
     gaussian_log_density = Independent(Normal(torch.zeros(2, device=device), torch.ones(2, device=device)), 1).log_prob
@@ -258,8 +256,8 @@ def plot_likelihood(
     sol = sol.detach().cpu().numpy()
 
     # plot
-    likelihood = torch.exp(log_p_acc).cpu().reshape(grid_size, grid_size).detach().numpy().T
-    exact_likelihood = torch.exp(exact_log_p).cpu().reshape(grid_size, grid_size).detach().numpy().T
+    likelihood = torch.exp(log_p_acc).cpu().reshape(grid_size, grid_size).detach().numpy()
+    exact_likelihood = torch.exp(exact_log_p).cpu().reshape(grid_size, grid_size).detach().numpy()
 
     fig, axs = plt.subplots(1, 2, figsize=(10, 6))
 
@@ -268,9 +266,9 @@ def plot_likelihood(
 
     norm = cm.colors.Normalize(vmax=cmax, vmin=cmin)
 
-    axs[0].imshow(likelihood, extent=extent, origin="upper", cmap="viridis", norm=norm)
+    axs[0].imshow(likelihood, extent=extent, origin="lower", cmap="viridis", norm=norm)
     axs[0].set_title(f"Model Likelihood, Hutchinson Estimator, #acc={num_acc}")
-    axs[1].imshow(exact_likelihood, extent=extent, origin="upper", cmap="viridis", norm=norm)
+    axs[1].imshow(exact_likelihood, extent=extent, origin="lower", cmap="viridis", norm=norm)
     axs[1].set_title("Exact Model Likelihood")
 
     fig.colorbar(cm.ScalarMappable(norm=norm, cmap="viridis"), ax=axs, orientation="horizontal", label="density")
