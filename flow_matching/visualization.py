@@ -5,10 +5,30 @@ import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from scipy.ndimage import gaussian_filter1d
 from torch.distributions import Independent, Normal
 
 from flow_matching.datasets import SyntheticDataset
 from flow_matching.solver import ModelWrapper, ODESolver
+
+
+def plot_loss_curve(losses: list[float], output_path: Path) -> None:
+    """Plot raw and smoothed training loss curve."""
+
+    steps = np.arange(1, len(losses) + 1)
+    smoothed_losses = gaussian_filter1d(losses, sigma=5)
+    blue = "#1f77b4"
+    plt.figure(figsize=(6, 5))
+    plt.plot(steps, losses, color=blue, alpha=0.3)
+    plt.plot(steps, smoothed_losses, color=blue, linewidth=2)
+    plt.title("Training dynamics", fontsize=16)
+    plt.xlabel("Steps", fontsize=14)
+    plt.ylabel("Loss", fontsize=14)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+    print("Training curves saved to", output_path)
 
 
 def plot_ode_sampling_evolution(

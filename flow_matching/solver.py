@@ -68,6 +68,30 @@ class ModelWrapper(ABC, nn.Module):
         return self.model(x=x, t=t, **extras)
 
 
+class TimeBroadcastWrapper(ModelWrapper):
+    """Wrap a model that expects `model(x_t=..., t=(batch, 1))`.
+
+    This wrapper makes ODE solvers compatible with models that require a batched time input.
+    """
+
+    def forward(self, x: Tensor, t: Tensor, **extras) -> Tensor:
+        if t.ndim == 0:
+            t = t.expand(x.shape[0], 1)
+        elif t.ndim == 1:
+            if t.shape[0] == 1:
+                t = t.expand(x.shape[0])
+            assert t.shape[0] == x.shape[0]
+            t = t[:, None]
+        else:
+            assert t.ndim == 2
+            if t.shape[0] == 1:
+                t = t.expand(x.shape[0], t.shape[1])
+            assert t.shape[0] == x.shape[0]
+            assert t.shape[1] == 1
+
+        return self.model(x_t=x, t=t.float(), **extras)
+
+
 class ODESolver:
     """A class to solve ordinary differential equations (ODEs) using a specified velocity model.
 
