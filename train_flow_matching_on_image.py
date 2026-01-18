@@ -1,18 +1,17 @@
-from dataclasses import dataclass
-from functools import partial
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+import tyro
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid, save_image
-from tqdm import tqdm as std_tqdm
-from transformers import HfArgumentParser
+from tqdm.auto import tqdm
 
+from flow_matching import visualization
 from flow_matching.datasets.image_datasets import (
     get_image_dataset,
     get_test_transform,
@@ -22,8 +21,6 @@ from flow_matching.models import UNetModel
 from flow_matching.sampler import PathSampler
 from flow_matching.solver import ModelWrapper, ODESolver
 from flow_matching.utils import model_size_summary, set_seed
-
-tqdm = partial(std_tqdm, dynamic_ncols=True)
 
 
 @dataclass
@@ -36,14 +33,29 @@ class ScriptArguments:
     learning_rate: float = 1e-3
     sigma_min: float = 0.0
     seed: int = 42
-    output_dir: str = "outputs"
+    output_dir: Path = Path("outputs")
     horizontal_flip: bool = False
+    num_inference_steps: int = field(
+        default=20,
+        metadata={
+            "help": "Number of fixed steps for integrating t in [0, 1] (dt = 1 / num_inference_steps). Note: NFE depends on `method` (e.g., midpoint uses 2 model evals per step)."
+        },
+    )
+    num_output_steps: int = field(
+        default=101,
+        metadata={
+            "help": "Number of output time points in [0, 1] to save/visualize (i.e., GIF frames). This does not control internal solver steps."
+        },
+    )
+    samples_per_class: int = 10
+    fps: int = 20
+    method: str = "midpoint"
 
 
 def train(args: ScriptArguments):
     """Train the flow matching model on the given dataset."""
 
-    output_dir = Path(args.output_dir) / "cfm" / args.dataset
+    output_dir = args.output_dir / "cfm" / args.dataset
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,9 +91,10 @@ def train(args: ScriptArguments):
     print("GradScaler enabled:", scaler._enabled)
     model_size_summary(flow)
 
+    losses: list[float] = []
     for epoch in range(args.n_epochs):
         flow.train()
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1:2d}/{args.n_epochs}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1:2d}/{args.n_epochs}", dynamic_ncols=True)
 
         for x_1, y in pbar:
             x_1, y = x_1.to(device), y.to(device)
@@ -104,17 +117,22 @@ def train(args: ScriptArguments):
             scaler.step(optimizer)
             scaler.update()
 
-            pbar.set_postfix({"loss": loss.item()})
+            loss_item = loss.item()
+            losses.append(loss_item)
+            pbar.set_postfix({"loss": loss_item})
 
     torch.save(flow.state_dict(), output_dir / "ckpt.pth")
     print(f"Final checkpoint saved to {output_dir / 'ckpt.pth'}")
+    visualization.plot_loss_curve(losses=losses, output_path=output_dir / "losses.png")
 
 
 def generate_samples_and_save_animation(args: ScriptArguments):
     """Generate samples following the flow and save the animation."""
 
-    output_dir = Path(args.output_dir) / "cfm" / args.dataset
+    output_dir = args.output_dir / "cfm" / args.dataset
     assert output_dir.is_dir(), f"Output directory {output_dir} does not exist"
+    ckpt_path = output_dir / "ckpt.pth"
+    assert ckpt_path.is_file(), f"Checkpoint {ckpt_path} does not exist"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_seed(args.seed)
@@ -137,29 +155,23 @@ def generate_samples_and_save_animation(args: ScriptArguments):
         num_classes=num_classes,
         class_cond=True,
     ).to(device)
-    state_dict = torch.load(output_dir / "ckpt.pth", weights_only=True)
+    state_dict = torch.load(ckpt_path, weights_only=True)
     flow.load_state_dict(state_dict)
     flow.eval()
 
     # Use ODE solver to sample trajectories
-    class WrappedModel(ModelWrapper):
-        def forward(self, x: Tensor, t: Tensor, **extras) -> Tensor:
-            return self.model(x=x, t=t, **extras)
+    t_eval = torch.linspace(0, 1, args.num_output_steps, device=device)
+    class_list = torch.arange(num_classes, device=device).repeat(args.samples_per_class)
 
-    samples_per_class = 10
-    sample_steps = 101
-    time_steps = torch.linspace(0, 1, sample_steps).to(device)
-    class_list = torch.arange(num_classes, device=device).repeat(samples_per_class)
-
-    wrapped_model = WrappedModel(flow)
-    step_size = 0.05
+    wrapped_model = ModelWrapper(flow)
+    step_size = 1.0 / args.num_inference_steps
     x_init = torch.randn((class_list.size(0), *input_shape), dtype=torch.float32, device=device)
     solver = ODESolver(wrapped_model)
     sol = solver.sample(
         x_init=x_init,
         step_size=step_size,
-        method="midpoint",
-        time_grid=time_steps,
+        method=args.method,
+        time_grid=t_eval,
         return_intermediates=True,
         y=class_list,
     )
@@ -178,18 +190,17 @@ def generate_samples_and_save_animation(args: ScriptArguments):
         grid = make_grid(sol[frame], nrow=num_classes, normalize=True)
         ax[1].clear()
         ax[1].imshow(grid.permute(1, 2, 0))
-        ax[1].set_title(f"t = {time_steps[frame].item():.2f}", fontsize=16)
+        ax[1].set_title(f"t = {t_eval[frame].item():.2f}", fontsize=16)
         ax[1].axis("off")
 
     fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.05, wspace=0.1)
-    ani = animation.FuncAnimation(fig, update, frames=sample_steps)
-    ani.save(output_dir / "trajectory.gif", writer="pillow", fps=20)
+    ani = animation.FuncAnimation(fig, update, frames=args.num_output_steps)
+    ani.save(output_dir / "trajectory.gif", writer="pillow", fps=args.fps)
     print(f"Generated trajectory saved to {output_dir / 'trajectory.gif'}")
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser(ScriptArguments)
-    script_args, *_ = parser.parse_args_into_dataclasses()
+    script_args = tyro.cli(ScriptArguments)
 
     if script_args.do_train:
         train(script_args)

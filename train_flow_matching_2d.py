@@ -88,7 +88,6 @@ def main(args: ScriptArguments) -> None:
 
     flow.eval()
     torch.save(flow.state_dict(), output_dir / "ckpt.pth")
-
     visualization.plot_loss_curve(losses=losses, output_path=output_dir / "losses.png")
 
     # Sampling with ODE solver and visualization
