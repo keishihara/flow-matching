@@ -1,4 +1,4 @@
-import argparse
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import matplotlib.animation as animation
@@ -6,117 +6,136 @@ import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import tyro
+from jaxtyping import Float
 from torch import Tensor, nn
 from torch.nn import Module
 
-from flow_matching.datasets import TOY_DATASETS
-from flow_matching.solver import ModelWrapper, ODESolver
+from flow_matching.datasets import TOY_DATASETS, SyntheticDataset, ToyDatasetName
+from flow_matching.solver import ODESolver, TimeBroadcastWrapper
 
 
 def sample(
-    ode_model: ModelWrapper,
+    ode_model: TimeBroadcastWrapper,
     source_samples: Tensor,
-    sample_steps: int = 2,
-    step_size: float = 0.05,
-    method: str = "midpoint",
-    return_intermediates: bool = False,
+    num_output_steps: int,
+    num_inference_steps: int,
+    method: str,
+    return_intermediates: bool,
     **model_kwargs,
-):
+) -> Tensor:
     device = next(ode_model.parameters()).device
     x_init = source_samples.to(device)
-    time_grid = torch.linspace(0, 1, sample_steps).to(device)  # sample times
+    t_eval = torch.linspace(0, 1, num_output_steps, device=device)
     solver = ODESolver(ode_model)
-    samples = solver.sample(
+    step_size = 1.0 / num_inference_steps
+    return solver.sample(
         x_init=x_init,
         step_size=step_size,
         method=method,
-        time_grid=time_grid,
+        time_grid=t_eval,
         return_intermediates=return_intermediates,
         **model_kwargs,
     )
-    return samples
 
 
-class Swish(Module):
-    def forward(self, x: Tensor) -> Tensor:
-        return x * torch.sigmoid(x)
+@dataclass
+class ScriptArguments:
+    dataset: ToyDatasetName = "checkerboard"
+    output_dir: Path = Path("outputs")
+    num_samples: int = 500_000
+    grid_size: int = 15
+    num_output_steps: int = field(
+        default=101,
+        metadata={
+            "help": "Number of output time points in [0, 1] to save/visualize (i.e., GIF frames). This does not control internal solver steps."
+        },
+    )
+    num_inference_steps: int = field(
+        default=20,
+        metadata={
+            "help": "Number of fixed steps for integrating t in [0, 1] (dt = 1 / num_inference_steps). Note: NFE depends on `method` (e.g., midpoint uses 2 model evals per step)."
+        },
+    )
+    method: str = "midpoint"
+    fps: int = 20
 
 
 class Mlp(Module):
     def __init__(self, dim: int = 2, time_dim: int = 1, h: int = 64) -> None:
         super().__init__()
-        self.input_dim = dim
-        self.time_dim = time_dim
-        self.hidden_dim = h
         self.layers = nn.Sequential(
             nn.Linear(dim + time_dim, h),
-            Swish(),
+            nn.SiLU(),
             nn.Linear(h, h),
-            Swish(),
+            nn.SiLU(),
             nn.Linear(h, h),
-            Swish(),
+            nn.SiLU(),
             nn.Linear(h, dim),
         )
 
-    def forward(self, x_t: Tensor, t: Tensor) -> Tensor:
-        size = x_t.size()
-        x_t = x_t.reshape(-1, self.input_dim)
-        t = t.reshape(-1, self.time_dim).float()
-        t = t.reshape(-1, 1).expand(x_t.size(0), 1)
-        h = torch.cat([x_t, t], dim=1)
-        output = self.layers(h)
-        return output.reshape(*size)
+    def forward(
+        self,
+        x_t: Float[Tensor, "batch dim"],
+        t: Float[Tensor, "batch time_dim"],
+    ) -> Float[Tensor, "batch dim"]:
+        return self.layers(torch.cat([x_t, t], dim=1))
 
 
-class WrappedModel(ModelWrapper):
-    def forward(self, x: Tensor, t: Tensor, **extras) -> Tensor:
-        return self.model(x_t=x, t=t, **extras)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default="checkerboard")
-    parser.add_argument("--sample-steps", type=int, default=101)
-    parser.add_argument("--num-samples", type=int, default=500_000)
-    parser.add_argument("--output-dir", type=str, default="outputs")
-    args = parser.parse_args()
-
+def main(args: ScriptArguments) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    cfm_path = f"{args.output_dir}/cfm/{args.dataset}/ckpt.pth"
-    reflow_path = f"{args.output_dir}/reflow/{args.dataset}/ckpt.pth"
+    cfm_path = args.output_dir / "cfm" / args.dataset / "ckpt.pth"
+    reflow_path = args.output_dir / "reflow" / args.dataset / "ckpt.pth"
+    if not cfm_path.is_file():
+        raise FileNotFoundError(f"CFM checkpoint {cfm_path} not found.")
+    if not reflow_path.is_file():
+        raise FileNotFoundError(f"Reflow checkpoint {reflow_path} not found.")
 
     cfm = Mlp(dim=2, time_dim=1, h=512)
     cfm.load_state_dict(torch.load(cfm_path, weights_only=True))
     cfm.to(device)
     cfm.eval()
-    wrapped_cfm = WrappedModel(cfm)
+    wrapped_cfm = TimeBroadcastWrapper(cfm)
 
     reflow = Mlp(dim=2, time_dim=1, h=512)
     reflow.load_state_dict(torch.load(reflow_path, weights_only=True))
     reflow.to(device)
     reflow.eval()
-    wrapped_reflow = WrappedModel(reflow)
+    wrapped_reflow = TimeBroadcastWrapper(reflow)
 
-    dataset = TOY_DATASETS[args.dataset](device=device)
+    dataset: SyntheticDataset = TOY_DATASETS[args.dataset](device=device)
 
     x_init = torch.randn(args.num_samples, 2).to(device)
-    samples_cfm = sample(wrapped_cfm, x_init, sample_steps=args.sample_steps, return_intermediates=True)
-    samples_reflow = sample(wrapped_reflow, x_init, sample_steps=args.sample_steps, return_intermediates=True)
+    samples_cfm = sample(
+        wrapped_cfm,
+        x_init,
+        num_output_steps=args.num_output_steps,
+        num_inference_steps=args.num_inference_steps,
+        method=args.method,
+        return_intermediates=True,
+    )
+    samples_reflow = sample(
+        wrapped_reflow,
+        x_init,
+        num_output_steps=args.num_output_steps,
+        num_inference_steps=args.num_inference_steps,
+        method=args.method,
+        return_intermediates=True,
+    )
 
     samples_cfm = samples_cfm.detach().cpu().numpy()
     samples_reflow = samples_reflow.detach().cpu().numpy()
 
     # Create a grid for the density and vector field
-    grid_size = 15
     x_range, y_range = dataset.get_square_range()
-    x = np.linspace(x_range[0], x_range[1], grid_size)
-    y = np.linspace(y_range[0], y_range[1], grid_size)
+    x = np.linspace(x_range[0], x_range[1], args.grid_size)
+    y = np.linspace(y_range[0], y_range[1], args.grid_size)
     xv, yv = np.meshgrid(x, y)
     grid = np.stack([xv, yv], axis=-1).reshape(-1, 2)  # Shape: (grid_size^2, 2)
 
     grid_tensor = torch.tensor(grid, dtype=torch.float32, device=device)
-    time_steps = torch.linspace(0, 1, args.sample_steps).to(device)
+    t_eval = torch.linspace(0, 1, args.num_output_steps, device=device)
 
     # Create a figure with two subplots
     fig, axes = plt.subplots(2, 2, figsize=(10, 10))
@@ -126,8 +145,7 @@ def main():
             ax.clear()
 
         # Current time step
-        t = time_steps[frame]
-        t_tensor = torch.full((grid_tensor.size(0), 1), t, device=device)
+        t = t_eval[frame]
 
         # Plot CFM samples
         axes[0, 0].hist2d(
@@ -158,8 +176,8 @@ def main():
         axes[0, 1].axis("off")
 
         # Plot CFM vector field
-        vectors_cfm = wrapped_cfm(grid_tensor, t_tensor).detach().cpu().numpy()
-        vectors_cfm = vectors_cfm.reshape(grid_size, grid_size, 2)
+        vectors_cfm = wrapped_cfm(x=grid_tensor, t=t).detach().cpu().numpy()
+        vectors_cfm = vectors_cfm.reshape(args.grid_size, args.grid_size, 2)
         magnitudes_cfm = np.linalg.norm(vectors_cfm, axis=2)
         axes[1, 0].quiver(
             xv,
@@ -182,8 +200,8 @@ def main():
         axes[1, 0].axis("off")
 
         # Plot Reflow vector field
-        vectors_reflow = wrapped_reflow(grid_tensor, t_tensor).detach().cpu().numpy()
-        vectors_reflow = vectors_reflow.reshape(grid_size, grid_size, 2)
+        vectors_reflow = wrapped_reflow(x=grid_tensor, t=t).detach().cpu().numpy()
+        vectors_reflow = vectors_reflow.reshape(args.grid_size, args.grid_size, 2)
         magnitudes_reflow = np.linalg.norm(vectors_reflow, axis=2)
         axes[1, 1].quiver(
             xv,
@@ -207,13 +225,14 @@ def main():
     # Adjust layout to reduce white space
     plt.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.05, wspace=0.1, hspace=0.05)
 
-    ani = animation.FuncAnimation(fig, update, frames=args.sample_steps)
+    ani = animation.FuncAnimation(fig, update, frames=args.num_output_steps)
 
     print("Saving animation...")
-    folder = Path(args.output_dir) / "comparisons"
-    folder.mkdir(parents=True, exist_ok=True)
-    ani.save(folder / f"cfm_reflow_{args.dataset}.gif", writer="pillow", fps=20)
+    filename = args.output_dir / "comparisons" / f"cfm_reflow_{args.dataset}.gif"
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    ani.save(filename, writer="pillow", fps=args.fps)
+    print(f"Saved animation to {filename}")
 
 
 if __name__ == "__main__":
-    main()
+    main(tyro.cli(ScriptArguments))
